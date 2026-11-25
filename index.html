@@ -1,0 +1,352 @@
+<!doctype html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f766e">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icon-192.png">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<title>Điểm danh điện thoại</title>
+<style>
+  :root { --bg:#f4f7f6; --card:#fff; --ink:#12302c; --muted:#5b7370; --brand:#0f766e; --ok:#15803d; --err:#b91c1c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#0e1514; --card:#16211f; --ink:#e6f1ef; --muted:#9bb3af; --brand:#2dd4bf; --ok:#4ade80; --err:#f87171; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         background:var(--bg); color:var(--ink); font:16px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; padding:16px; }
+  .card { width:100%; max-width:420px; background:var(--card); border-radius:20px; padding:28px 22px; text-align:center;
+          box-shadow:0 6px 24px rgba(0,0,0,.08); }
+  h1 { font-size:20px; margin:0 0 4px; }
+  p.sub { margin:0 0 20px; color:var(--muted); font-size:14px; }
+  #offline { margin-top:14px; font-size:12px; color:var(--muted); }
+  label { display:block; text-align:left; font-size:13px; color:var(--muted); margin:12px 0 4px; }
+  input { width:100%; padding:13px 14px; font-size:17px; border-radius:12px; border:1.5px solid #c5d3d0;
+          background:transparent; color:var(--ink); }
+  input:focus { outline:none; border-color:var(--brand); }
+  button { width:100%; border:0; border-radius:16px; background:var(--brand); color:#fff; font-size:19px; font-weight:600;
+           padding:18px; margin-top:18px; cursor:pointer; }
+  button:disabled { opacity:.55; cursor:default; }
+  button.big { padding:40px 18px; font-size:24px; border-radius:24px; }
+  button.link { background:none; color:var(--muted); font-size:13px; font-weight:400; padding:6px; margin-top:14px; text-decoration:underline; }
+  #who { font-size:15px; color:var(--muted); margin-bottom:6px; }
+  #status { min-height:48px; margin-top:16px; font-size:16px; }
+  #status.ok { color:var(--ok); font-weight:600; }
+  #status.err { color:var(--err); }
+  .hidden { display:none; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Điểm danh điện thoại</h1>
+  <p class="sub" id="sub"></p>
+
+  <!-- Màn hình đăng ký (chỉ hiện lần đầu) -->
+  <div id="enrollView" class="hidden">
+    <label for="inId">Mã học sinh</label>
+    <input id="inId" autocomplete="off" autocapitalize="characters" inputmode="text" maxlength="16">
+    <label for="inCode">Mã đăng ký do giáo viên cấp</label>
+    <input id="inCode" autocomplete="off" inputmode="numeric" maxlength="12">
+    <button id="btnEnroll">Đăng ký máy này</button>
+  </div>
+
+  <!-- Màn hình điểm danh -->
+  <div id="mainView" class="hidden">
+    <div id="who"></div>
+    <button id="btnGo" class="big">ĐIỂM DANH</button>
+    <button id="btnForget" class="link">Xóa đăng ký trên máy này</button>
+  </div>
+
+  <div id="status" role="status" aria-live="polite"></div>
+  <div id="offline"></div>
+</div>
+
+<script>
+"use strict";
+
+/* ====== CẤU HÌNH: sửa 1 dòng SCRIPT_URL, các UUID phải giống mã ESP32 ====== */
+const CFG = {
+  SCRIPT_URL: "https://script.google.com/macros/s/DAN_URL_APPS_SCRIPT_VAO_DAY/exec",
+  SERVICE:      "6e6f7465-0001-4a1b-9c1d-5a5a5a5a0001",
+  CH_CHALLENGE: "6e6f7465-0002-4a1b-9c1d-5a5a5a5a0001",
+  CH_RESPONSE:  "6e6f7465-0003-4a1b-9c1d-5a5a5a5a0001",
+  CH_STATUS:    "6e6f7465-0004-4a1b-9c1d-5a5a5a5a0001",
+  MAC_HEX_CHARS: 32,          // 16 byte (128-bit) là đủ
+  CONNECT_TIMEOUT_MS: 12000,
+  RESULT_TIMEOUT_MS: 20000,
+};
+
+const $ = (id) => document.getElementById(id);
+const enc = new TextEncoder();
+const dec = new TextDecoder();
+
+/* ---------- lưu trữ: ID ở localStorage, khóa HMAC (không xuất được) ở IndexedDB ---------- */
+const store = {
+  getId() { try { return localStorage.getItem("student_id") || ""; } catch { return ""; } },
+  getName() { try { return localStorage.getItem("student_name") || ""; } catch { return ""; } },
+  set(id, name) { localStorage.setItem("student_id", id); localStorage.setItem("student_name", name || ""); },
+  clear() { try { localStorage.removeItem("student_id"); localStorage.removeItem("student_name"); } catch {} },
+};
+
+function idb() {
+  return new Promise((res, rej) => {
+    const r = indexedDB.open("diemdanh", 1);
+    r.onupgradeneeded = () => r.result.createObjectStore("keys");
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+}
+async function keyGet() {
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const q = db.transaction("keys").objectStore("keys").get("hmac");
+    q.onsuccess = () => res(q.result || null);
+    q.onerror = () => rej(q.error);
+  });
+}
+async function keySet(k) {
+  const db = await idb();
+  return new Promise((res, rej) => {
+    const tx = db.transaction("keys", "readwrite");
+    tx.objectStore("keys").put(k, "hmac");
+    tx.oncomplete = () => res();
+    tx.onerror = () => rej(tx.error);
+  });
+}
+async function keyDelete() {
+  const db = await idb();
+  return new Promise((res) => {
+    const tx = db.transaction("keys", "readwrite");
+    tx.objectStore("keys").delete("hmac");
+    tx.oncomplete = () => res();
+    tx.onerror = () => res();
+  });
+}
+
+/* ---------- tiện ích ---------- */
+const toHex = (buf) => [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+const withTimeout = (p, ms, msg) =>
+  Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
+
+function setStatus(text, cls) {
+  const el = $("status");
+  el.textContent = text || "";
+  el.className = cls || "";
+}
+
+function feedback(ok) {
+  try { if (navigator.vibrate) navigator.vibrate(ok ? [70, 50, 70] : [350]); } catch {}
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const ac = new AC();
+    const tone = (freq, start, dur) => {
+      const o = ac.createOscillator(), g = ac.createGain();
+      o.type = "sine"; o.frequency.value = freq;
+      g.gain.setValueAtTime(0.0001, ac.currentTime + start);
+      g.gain.exponentialRampToValueAtTime(0.35, ac.currentTime + start + 0.02);
+      g.gain.exponentialRampToValueAtTime(0.0001, ac.currentTime + start + dur);
+      o.connect(g); g.connect(ac.destination);
+      o.start(ac.currentTime + start); o.stop(ac.currentTime + start + dur + 0.05);
+    };
+    if (ok) { tone(880, 0, 0.12); tone(1320, 0.14, 0.18); } else { tone(200, 0, 0.45); }
+    setTimeout(() => ac.close && ac.close(), 1200);
+  } catch {}
+}
+
+const ERRORS = {
+  unknown_id: "Mã học sinh không có trong danh sách.",
+  bad_code: "Mã đăng ký không đúng.",
+  already_enrolled: "Mã học sinh này đã được đăng ký. Hãy nhờ giáo viên cấp mã mới.",
+  locked: "Nhập sai quá nhiều lần. Hãy nhờ giáo viên mở khóa.",
+  invalid: "Thông tin chưa hợp lệ.",
+  auth: "ESP32 và Apps Script chưa khớp khóa bí mật.",
+  not_enrolled: "Máy chưa được đăng ký trên hệ thống.",
+  bad_mac: "Mã xác minh không khớp. Hãy đăng ký lại với giáo viên.",
+  replay: "Lượt này đã được dùng rồi, hãy thử lại.",
+  nonce: "Thử thách đã hết hạn, hãy thử lại.",
+  server: "ESP32 không kết nối được máy chủ.",
+  busy: "Thiết bị đang bận, thử lại sau vài giây.",
+};
+const errText = (code) => ERRORS[code] || ("Lỗi: " + code);
+
+/* ---------- đăng ký (lần đầu, đi thẳng HTTPS tới Apps Script, KHÔNG qua Bluetooth) ---------- */
+async function enroll() {
+  const id = $("inId").value.trim();
+  const code = $("inCode").value.trim();
+  if (!id || !code) { setStatus("Nhập đủ mã học sinh và mã đăng ký.", "err"); return; }
+  if (CFG.SCRIPT_URL.includes("DAN_URL")) { setStatus("Chưa cấu hình SCRIPT_URL trong file.", "err"); return; }
+  if (navigator.onLine === false) { setStatus("Đăng ký cần có mạng. Hãy kết nối Wi-Fi rồi thử lại. (Điểm danh sau này thì không cần mạng.)", "err"); return; }
+
+  $("btnEnroll").disabled = true;
+  setStatus("Đang đăng ký…");
+  try {
+    const raw = crypto.getRandomValues(new Uint8Array(32));
+    const secretHex = toHex(raw);
+    const device = (navigator.userAgent + " | " + screen.width + "x" + screen.height).slice(0, 200);
+    const r = await withTimeout(fetch(CFG.SCRIPT_URL, {
+      method: "POST",
+      body: JSON.stringify({ action: "enroll", id, code, secret: secretHex, device }),
+    }), 20000, "Hết thời gian chờ máy chủ");
+    const data = await r.json();
+    if (!data.ok) { setStatus(errText(data.error), "err"); feedback(false); return; }
+
+    // Khóa HMAC lưu dạng không xuất được: chỉ ký, không đọc ngược ra
+    const key = await crypto.subtle.importKey("raw", enc.encode(secretHex),
+      { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    await keySet(key);
+    store.set(id, data.name || "");
+    try { if (navigator.storage && navigator.storage.persist) navigator.storage.persist(); } catch {}
+    setStatus("");
+    render();
+    setStatus("Đăng ký thành công.", "ok");
+    feedback(true);
+  } catch (e) {
+    setStatus("Lỗi mạng: " + e.message, "err");
+    feedback(false);
+  } finally {
+    $("btnEnroll").disabled = false;
+  }
+}
+
+/* ---------- kết nối ESP32 ---------- */
+async function pickDevice() {
+  // Thử dùng lại thiết bị đã cấp quyền trước đó (không cần chọn lại), nếu trình duyệt hỗ trợ
+  if (navigator.bluetooth.getDevices) {
+    try {
+      const list = await navigator.bluetooth.getDevices();
+      if (list.length) return { device: list[0], known: true };
+    } catch {}
+  }
+  const device = await navigator.bluetooth.requestDevice({ filters: [{ services: [CFG.SERVICE] }] });
+  return { device, known: false };
+}
+
+async function connectGatt(device) {
+  return withTimeout(device.gatt.connect(), CFG.CONNECT_TIMEOUT_MS, "Không thấy thiết bị ở gần");
+}
+
+async function checkIn() {
+  const id = store.getId();
+  const key = await keyGet();
+  if (!id || !key) { setStatus("Máy chưa được đăng ký.", "err"); render(); return; }
+  if (!navigator.bluetooth) { setStatus("Trình duyệt không hỗ trợ Bluetooth.", "err"); return; }
+
+  $("btnGo").disabled = true;
+  setStatus("Đang kết nối…");
+  let device = null;
+  try {
+    let pick = await pickDevice();
+    device = pick.device;
+    let server;
+    try {
+      server = await connectGatt(device);
+    } catch (e) {
+      // thiết bị cũ không ở gần: thử chọn lại bằng hộp thoại (cần chạm tay)
+      if (pick.known) {
+        try { device.gatt.disconnect(); } catch {}
+        pick = { device: await navigator.bluetooth.requestDevice({ filters: [{ services: [CFG.SERVICE] }] }), known: false };
+        device = pick.device;
+        server = await connectGatt(device);
+      } else { throw e; }
+    }
+
+    const svc = await server.getPrimaryService(CFG.SERVICE);
+    const chChal = await svc.getCharacteristic(CFG.CH_CHALLENGE);
+    const chResp = await svc.getCharacteristic(CFG.CH_RESPONSE);
+    const chStat = await svc.getCharacteristic(CFG.CH_STATUS);
+
+    await chStat.startNotifications();
+    const result = new Promise((resolve, reject) => {
+      const t = setTimeout(() => reject(new Error("Hết thời gian chờ kết quả")), CFG.RESULT_TIMEOUT_MS);
+      chStat.addEventListener("characteristicvaluechanged", (ev) => {
+        clearTimeout(t);
+        resolve(dec.decode(ev.target.value));
+      }, { once: true });
+    });
+    result.catch(() => {});
+
+    const nonce = dec.decode(await chChal.readValue()).trim();
+    if (!/^[0-9a-f]{16}$/.test(nonce)) throw new Error("Thử thách không hợp lệ");
+
+    setStatus("Đang gửi…");
+    const sig = await crypto.subtle.sign("HMAC", key, enc.encode(id + "|" + nonce));
+    const mac = toHex(sig).slice(0, CFG.MAC_HEX_CHARS);
+    const payload = enc.encode(id + "|" + mac);
+    if (chResp.writeValueWithResponse) await chResp.writeValueWithResponse(payload);
+    else await chResp.writeValue(payload);
+
+    const text = await result;            // dạng "OK|số_ngăn" hoặc "ERR|mã_lỗi"
+    const [state, extra] = text.split("|");
+    if (state === "OK") {
+      const slot = parseInt(extra, 10);   // số ngăn trong tủ; không có thì chỉ báo đã điểm danh
+      setStatus(slot > 0 ? "Đã điểm danh. Hãy cất điện thoại vào ngăn số " + slot : "Đã điểm danh", "ok");
+      feedback(true);
+    } else {
+      setStatus(errText(extra), "err");
+      feedback(false);
+    }
+  } catch (e) {
+    const msg = e && e.name === "NotFoundError" ? "Bạn chưa chọn thiết bị." : (e.message || String(e));
+    setStatus(msg, "err");
+    feedback(false);
+  } finally {
+    try { if (device && device.gatt.connected) device.gatt.disconnect(); } catch {}
+    $("btnGo").disabled = false;
+  }
+}
+
+/* ---------- giao diện ---------- */
+function render() {
+  const id = store.getId();
+  const enrolled = !!id;
+  $("enrollView").classList.toggle("hidden", enrolled);
+  $("mainView").classList.toggle("hidden", !enrolled);
+  $("sub").textContent = enrolled ? "Đứng gần thiết bị rồi bấm nút bên dưới." : "Đăng ký máy này một lần duy nhất.";
+  if (enrolled) {
+    const n = store.getName();
+    $("who").textContent = (n ? n + " · " : "") + "Mã " + id;
+  }
+}
+
+async function forget() {
+  if (!confirm("Xóa đăng ký trên máy này? Muốn đăng ký lại bạn cần mã mới từ giáo viên.")) return;
+  store.clear();
+  await keyDelete();
+  setStatus("");
+  render();
+}
+
+$("btnEnroll").addEventListener("click", enroll);
+$("btnGo").addEventListener("click", checkIn);
+$("btnForget").addEventListener("click", forget);
+
+/* ---------- chế độ ngoại tuyến ---------- */
+if ("serviceWorker" in navigator) {
+  navigator.serviceWorker.register("sw.js")
+    .then(() => navigator.serviceWorker.ready)
+    .then(() => { $("offline").textContent = "✓ Đã lưu trong máy, mở được khi không có mạng"; })
+    .catch(() => {});
+}
+
+(async function init() {
+  render();
+  if (!window.isSecureContext) { setStatus("Cần mở trang qua HTTPS.", "err"); return; }
+  if (!navigator.bluetooth) {
+    setStatus("Trình duyệt này không hỗ trợ Web Bluetooth. Dùng Chrome trên Android, hoặc Bluefy trên iPhone.", "err");
+    $("btnGo").disabled = true;
+    return;
+  }
+  // nếu đã đăng ký và từng ghép đúng thiết bị, thử điểm danh ngay khi mở trang
+  if (store.getId() && navigator.bluetooth.getDevices) {
+    try {
+      const list = await navigator.bluetooth.getDevices();
+      if (list.length) checkIn();
+    } catch {}
+  }
+})();
+</script>
+</body>
+</html>
